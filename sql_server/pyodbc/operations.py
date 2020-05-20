@@ -1,58 +1,48 @@
 import datetime
-import decimal
 import time
+import uuid
+import warnings
 
 from django.conf import settings
-from django.db.backends import BaseDatabaseOperations
+from django.db.backends.base.operations import BaseDatabaseOperations
+from django.db.models.functions import Greatest, Least
+from django.utils import timezone
+from django.utils.encoding import force_text
+from django.utils.six import string_types
 
-from sql_server.pyodbc.compat import smart_text, string_types, timezone
+try:
+    import pytz
+except ImportError:
+    pytz = None
 
-EDITION_AZURE_SQL_DB = 5
 
 class DatabaseOperations(BaseDatabaseOperations):
-    compiler_module = "sql_server.pyodbc.compiler"
+    compiler_module = 'sql_server.pyodbc.compiler'
 
-    def __init__(self, connection):
-        if connection._DJANGO_VERSION >= 14:
-            super(DatabaseOperations, self).__init__(connection)
-        else:
-            super(DatabaseOperations, self).__init__()
-
-        self.connection = connection
-        self._ss_ver = None
-        self._ss_edition = None
-
-    def _get_sql_server_ver(self):
+    def _get_utcoffset(self, tzname):
         """
-        Returns the version of the SQL Server in use:
+        Returns UTC offset for given time zone in seconds
         """
-        if self._ss_ver is not None:
-            return self._ss_ver
-        cur = self.connection.cursor()
-        cur.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') as varchar)")
-        ver_code = cur.fetchone()[0]
-        ver_code = int(ver_code.split('.')[0])
-        if ver_code >= 12:
-            self._ss_ver = 2014
-        elif ver_code == 11:
-            self._ss_ver = 2012
-        elif ver_code == 10:
-            self._ss_ver = 2008
-        elif ver_code == 9:
-            self._ss_ver = 2005
-        else:
-            raise NotImplementedError('SQL Server v%d is not supported.' % ver_code)
-        return self._ss_ver
-    sql_server_ver = property(_get_sql_server_ver)
+        # SQL Server has no built-in support for tz database
+        # see http://blogs.msdn.com/b/sqlprogrammability/archive/2008/03/18/using-time-zone-data-in-sql-server-2008.aspx
+        if pytz is None:
+            from django.core.exceptions import ImproperlyConfigured
+            raise ImproperlyConfigured("This query requires pytz, "
+                                       "but it isn't installed.")
+        zone = pytz.timezone(tzname)
+        # no way to take DST into account at this point
+        now = datetime.datetime.now()
+        delta = zone.localize(now, is_dst=False).utcoffset()
+        return delta.days * 86400 + delta.seconds
 
-    def _on_azure_sql_db(self):
-        if self._ss_edition is not None:
-            return self._ss_edition == EDITION_AZURE_SQL_DB
-        cur = self.connection.cursor()
-        cur.execute("SELECT CAST(SERVERPROPERTY('EngineEdition') as integer)")
-        self._ss_edition = cur.fetchone()[0]
-        return self._ss_edition == EDITION_AZURE_SQL_DB
-    on_azure_sql_db = property(_on_azure_sql_db)
+    def _warn_legacy_driver(self, sqltype):
+        warnings.warn(
+            'A %s value was received as a string. This is because you '
+            'are now using a legacy ODBC driver which does not support '
+            'this data type while your database has been migrated using it. '
+            'You should upgrade your ODBC driver for consistency with your '
+            'database migration.' % sqltype,
+            RuntimeWarning)
 
     def bulk_batch_size(self, fields, objs):
         """
@@ -67,9 +57,10 @@ class DatabaseOperations(BaseDatabaseOperations):
             size = max_row_values // fields_len
         return size
 
-    def bulk_insert_sql(self, fields, num_values):
-        items_sql = "(%s)" % ", ".join(["%s"] * len(fields))
-        return "VALUES " + ", ".join([items_sql] * num_values)
+    def bulk_insert_sql(self, fields, placeholder_rows):
+        placeholder_rows_sql = (", ".join(row) for row in placeholder_rows)
+        values_sql = ", ".join("(%s)" % sql for sql in placeholder_rows_sql)
+        return "VALUES " + values_sql
 
     def cache_key_culling_sql(self):
         """
@@ -83,6 +74,80 @@ class DatabaseOperations(BaseDatabaseOperations):
                "ROW_NUMBER() OVER (ORDER BY cache_key) AS rn FROM %s" \
                ") cache WHERE rn = %%s + 1"
 
+    def check_expression_support(self, expression):
+        if self.connection.sql_server_version < 2008:
+            # we can't even emulate GREATEST nor LEAST
+            unsupported_functions = (Greatest, Least)
+            for f in unsupported_functions:
+                if isinstance(expression, f):
+                    raise NotImplementedError(
+                        'SQL Server has no support for %s function.' %
+                        f.function)
+
+    def combine_duration_expression(self, connector, sub_expressions):
+        lhs, rhs = sub_expressions
+        sign = ' * -1' if connector == '-' else ''
+        if lhs.startswith('DATEADD'):
+            col, sql = rhs, lhs
+        else:
+            col, sql = lhs, rhs
+        params = [sign for _ in range(sql.count('DATEADD'))]
+        params.append(col)
+        return sql % tuple(params)
+
+    def combine_expression(self, connector, sub_expressions):
+        """
+        SQL Server requires special cases for some operators in query expressions
+        """
+        if connector == '^':
+            return 'POWER(%s)' % ','.join(sub_expressions)
+        return super(DatabaseOperations, self).combine_expression(connector, sub_expressions)
+
+    def convert_datefield_value(self, value, expression, connection, context):
+        if value is not None:
+            # WDAC and old FreeTDS receive a date value as a string
+            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
+            if isinstance(value, string_types):
+                self._warn_legacy_driver('date')
+                value = datetime.date(*map(lambda x: int(x), value.split('-')))
+            elif self.connection.use_legacy_datetime:
+                if isinstance(value, datetime.datetime):
+                    value = value.date() # extract date
+        return value
+
+    def convert_datetimefield_value(self, value, expression, connection, context):
+        if value is not None:
+            # WDAC and old FreeTDS receive a datetime2 value as a string
+            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
+            if isinstance(value, string_types):
+                self._warn_legacy_driver('datetime2')
+                value = datetime.datetime.strptime(value[:26], '%Y-%m-%d %H:%M:%S.%f')
+            if settings.USE_TZ:
+                value = timezone.make_aware(value, timezone.utc)
+        return value
+
+    def convert_floatfield_value(self, value, expression, connection, context):
+        if value is not None:
+            value = float(value)
+        return value
+
+    def convert_timefield_value(self, value, expression, connection, context):
+        if value is not None:
+            # WDAC and old FreeTDS receive a time value as a string
+            # http://blogs.msdn.com/b/sqlnativeclient/archive/2008/02/27/microsoft-sql-server-native-client-and-microsoft-sql-server-2008-native-client.aspx
+            if isinstance(value, string_types):
+                self._warn_legacy_driver('time')
+                value = datetime.time(*map(lambda x: int(x), value[:15].replace('.', ':').split(':')))
+            elif self.connection.use_legacy_datetime:
+                if (isinstance(value, datetime.datetime) and value.year == 1900 and value.month == value.day == 1):
+                    value = value.time() # extract time
+        return value
+
+    def convert_uuidfield_value(self, value, expression, connection, context):
+        if value is not None:
+            value = uuid.UUID(value)
+        return value
+
     def date_extract_sql(self, lookup_type, field_name):
         """
         Given a lookup_type of 'year', 'month', 'day' or 'week_day', returns
@@ -93,42 +158,65 @@ class DatabaseOperations(BaseDatabaseOperations):
         else:
             return "DATEPART(%s, %s)" % (lookup_type, field_name)
 
-    def date_interval_sql(self, sql, connector, timedelta):
+    def date_interval_sql(self, timedelta):
         """
         implements the interval functionality for expressions
         """
-        sign = 1
-        if connector != '+':
-            sign = -1
-        sec = (timedelta.seconds + timedelta.days * 86400) * sign
-        if sec:
-            sql = 'DATEADD(SECOND, %d, CAST(%s AS DATETIME))' % (sec, sql)
-        if timedelta.microseconds and self.sql_server_ver >= 2008:
-            sql = 'DATEADD(MICROSECOND, %d, CAST(%s AS DATETIME2))' % \
-                (timedelta.microseconds * sign, sql)
-        return sql
+        sec = timedelta.seconds + timedelta.days * 86400
+        sql = 'DATEADD(second, %d%%s, CAST(%%s AS datetime))' % sec
+        if timedelta.microseconds:
+            if self.connection.use_legacy_datetime:
+                sql = 'DATEADD(millisecond, %d%%s, CAST(%s AS datetime))' % (timedelta.microseconds // 1000, sql)
+            else:
+                sql = 'DATEADD(microsecond, %d%%s, CAST(%s AS datetime2))' % (timedelta.microseconds, sql)
+        return sql, ()
 
     def date_trunc_sql(self, lookup_type, field_name):
         """
         Given a lookup_type of 'year', 'month' or 'day', returns the SQL that
-        truncates the given date field field_name to a DATE object with only
+        truncates the given date field field_name to a date object with only
         the given specificity.
         """
         if lookup_type == 'year':
-            return "Convert(datetime, Convert(varchar, DATEPART(year, %s)) + '/01/01')" % field_name
+            return "CONVERT(datetime, CONVERT(varchar, DATEPART(year, %s)) + '/01/01')" % field_name
         if lookup_type == 'month':
-            return "Convert(datetime, Convert(varchar, DATEPART(year, %s)) + '/' + Convert(varchar, DATEPART(month, %s)) + '/01')" % (field_name, field_name)
+            return "CONVERT(datetime, CONVERT(varchar, DATEPART(year, %s)) + '/' + CONVERT(varchar, DATEPART(month, %s)) + '/01')" % (field_name, field_name)
         if lookup_type == 'day':
-            return "Convert(datetime, Convert(varchar(12), %s, 112))" % field_name
+            return "CONVERT(datetime, CONVERT(varchar(12), %s, 112))" % field_name
 
-    def field_cast_sql(self, db_type):
-        """
-        Given a column type (e.g. 'BLOB', 'VARCHAR'), returns the SQL necessary
-        to cast it before using it in a WHERE statement. Note that the
-        resulting string should contain a '%s' placeholder for the column being
-        searched against.
-        """
-        return '%s'
+    def datetime_cast_date_sql(self, field_name, tzname):
+        if settings.USE_TZ and not tzname == 'UTC':
+            offset = self._get_utcoffset(tzname)
+            field_name = 'DATEADD(second, %d, %s)' % (offset, field_name)
+        if self.connection.use_legacy_datetime:
+            sql = 'CONVERT(datetime, CONVERT(char(10), %s, 101), 101)' % field_name
+        else:
+            sql = 'CAST(%s AS date)' % field_name
+        return sql, []
+
+    def datetime_extract_sql(self, lookup_type, field_name, tzname):
+        if settings.USE_TZ and not tzname == 'UTC':
+            offset = self._get_utcoffset(tzname)
+            field_name = 'DATEADD(second, %d, %s)' % (offset, field_name)
+        params = []
+        sql = self.date_extract_sql(lookup_type, field_name)
+        return sql, params
+
+    def datetime_trunc_sql(self, lookup_type, field_name, tzname):
+        if settings.USE_TZ and not tzname == 'UTC':
+            offset = self._get_utcoffset(tzname)
+            field_name = 'DATEADD(second, %d, %s)' % (offset, field_name)
+        params = []
+        sql = ''
+        if lookup_type in ('year', 'month', 'day'):
+            sql = self.date_trunc_sql(lookup_type, field_name)
+        elif lookup_type == 'hour':
+            sql = "CONVERT(datetime, SUBSTRING(CONVERT(varchar, %s, 20), 0, 14) + ':00:00')" % field_name
+        elif lookup_type == 'minute':
+            sql = "CONVERT(datetime, SUBSTRING(CONVERT(varchar, %s, 20), 0, 17) + ':00')" % field_name
+        elif lookup_type == 'second':
+            sql = "CONVERT(datetime, CONVERT(varchar, %s, 20))" % field_name
+        return sql, params
 
     def for_update_sql(self, nowait=False):
         """
@@ -139,6 +227,13 @@ class DatabaseOperations(BaseDatabaseOperations):
         else:
             return 'WITH (ROWLOCK, UPDLOCK)'
 
+    def format_for_duration_arithmetic(self, sql):
+        if self.connection.use_legacy_datetime:
+            fmt = 'DATEADD(second, %s / 1000000%%s, DATEADD(millisecond, %s / 1000 %%%%%%%% 1000%%s, CAST(%%s AS datetime)))'
+        else:
+            fmt = 'DATEADD(second, %s / 1000000%%s, DATEADD(microsecond, %s %%%%%%%% 1000000%%s, CAST(%%s AS datetime2)))'
+        return fmt % (sql, sql)
+
     def fulltext_search_sql(self, field_name):
         """
         Returns the SQL WHERE clause to use in order to perform a full-text
@@ -146,6 +241,21 @@ class DatabaseOperations(BaseDatabaseOperations):
         contain a '%s' placeholder for the value being searched against.
         """
         return 'CONTAINS(%s, %%s)' % field_name
+
+    def get_db_converters(self, expression):
+        converters = super(DatabaseOperations, self).get_db_converters(expression)
+        internal_type = expression.output_field.get_internal_type()
+        if internal_type == 'DateField':
+            converters.append(self.convert_datefield_value)
+        elif internal_type == 'DateTimeField':
+            converters.append(self.convert_datetimefield_value)
+        elif internal_type == 'FloatField':
+            converters.append(self.convert_floatfield_value)
+        elif internal_type == 'TimeField':
+            converters.append(self.convert_timefield_value)
+        elif internal_type == 'UUIDField':
+            converters.append(self.convert_uuidfield_value)
+        return converters
 
     def last_insert_id(self, cursor, table_name, pk_name):
         """
@@ -171,24 +281,22 @@ class DatabaseOperations(BaseDatabaseOperations):
         # @@IDENTITY is not limited to a specific scope.
 
         table_name = self.quote_name(table_name)
-        cursor.execute("SELECT CAST(IDENT_CURRENT(%s) as bigint)", [table_name])
+        cursor.execute("SELECT CAST(IDENT_CURRENT(%s) AS int)", [table_name])
         return cursor.fetchone()[0]
 
-    def fetch_returned_insert_id(self, cursor):
-        """
-        Given a cursor object that has just performed an INSERT/OUTPUT statement
-        into a table that has an auto-incrementing ID, returns the newly created
-        ID.
-        """
-        return cursor.fetchone()[0]
-
-    def lookup_cast(self, lookup_type):
+    def lookup_cast(self, lookup_type, internal_type=None):
         if lookup_type in ('iexact', 'icontains', 'istartswith', 'iendswith'):
             return "UPPER(%s)"
         return "%s"
 
     def max_name_length(self):
         return 128
+
+    def no_limit_value(self):
+        return None
+
+    def prepare_sql_script(self, sql, _allow_fallback=False):
+        return [sql]
 
     def quote_name(self, name):
         """
@@ -228,34 +336,34 @@ class DatabaseOperations(BaseDatabaseOperations):
         """
         return super(DatabaseOperations, self).last_executed_query(cursor, cursor.last_sql, cursor.last_params)
 
-    #def savepoint_create_sql(self, sid):
-    #    """
-    #    Returns the SQL for starting a new savepoint. Only required if the
-    #    "uses_savepoints" feature is True. The "sid" parameter is a string
-    #    for the savepoint id.
-    #    """
-    #    return "SAVE TRANSACTION %s" % sid
+    def savepoint_create_sql(self, sid):
+        """
+        Returns the SQL for starting a new savepoint. Only required if the
+        "uses_savepoints" feature is True. The "sid" parameter is a string
+        for the savepoint id.
+        """
+        return "SAVE TRANSACTION %s" % sid
 
-    #def savepoint_commit_sql(self, sid):
-    #    """
-    #    Returns the SQL for committing the given savepoint.
-    #    """
-    #    return "COMMIT TRANSACTION %s" % sid
+    def savepoint_rollback_sql(self, sid):
+        """
+        Returns the SQL for rolling back the given savepoint.
+        """
+        return "ROLLBACK TRANSACTION %s" % sid
 
-    #def savepoint_rollback_sql(self, sid):
-    #    """
-    #    Returns the SQL for rolling back the given savepoint.
-    #    """
-    #    return "ROLLBACK TRANSACTION %s" % sid
-
-    def sql_flush(self, style, tables, sequences):
+    def sql_flush(self, style, tables, sequences, allow_cascade=False):
         """
         Returns a list of SQL statements required to remove all data from
         the given database tables (without actually removing the tables
         themselves).
 
+        The returned value also includes SQL statements required to reset DB
+        sequences passed in :param sequences:.
+
         The `style` argument is a Style object as returned by either
         color_style() or no_style() in django.core.management.color.
+
+        The `allow_cascade` argument determines whether truncation may cascade
+        to tables with foreign keys pointing the tables being truncated.
         """
         if tables:
             # Cannot use TRUNCATE on tables that are referenced by a FOREIGN KEY
@@ -282,10 +390,10 @@ class DatabaseOperations(BaseDatabaseOperations):
             sql_list.extend(['%s %s %s;' % (style.SQL_KEYWORD('DELETE'), style.SQL_KEYWORD('FROM'),
                              style.SQL_FIELD(self.quote_name(table)) ) for table in tables])
 
-            if self.on_azure_sql_db:
+            if self.connection.to_azure_sql_db and self.connection.sql_server_version < 2014:
                 import warnings
-                warnings.warn("The identity columns will never be reset " \
-                              "on Azure SQL Database.",
+                warnings.warn("Resetting identity columns is not supported " \
+                              "on this versios of Azure SQL Database.",
                               RuntimeWarning)
             else:
                 # Then reset the counters on each table.
@@ -305,32 +413,13 @@ class DatabaseOperations(BaseDatabaseOperations):
         else:
             return []
 
-    #def sequence_reset_sql(self, style, model_list):
-    #    """
-    #    Returns a list of the SQL statements required to reset sequences for
-    #    the given models.
-    #
-    #    The `style` argument is a Style object as returned by either
-    #    color_style() or no_style() in django.core.management.color.
-    #    """
-    #    from django.db import models
-    #    output = []
-    #    for model in model_list:
-    #        for f in model._meta.local_fields:
-    #            if isinstance(f, models.AutoField):
-    #                output.append(...)
-    #                break # Only one AutoField is allowed per model, so don't bother continuing.
-    #        for f in model._meta.many_to_many:
-    #            output.append(...)
-    #    return output
-
     def start_transaction_sql(self):
         """
         Returns the SQL statement required to start a transaction.
         """
         return "BEGIN TRANSACTION"
 
-    def sql_for_tablespace(self, tablespace, inline=False):
+    def tablespace_sql(self, tablespace, inline=False):
         """
         Returns the SQL that will be appended to tables or rows to define
         a tablespace. Returns '' if the backend doesn't use tablespaces.
@@ -340,7 +429,7 @@ class DatabaseOperations(BaseDatabaseOperations):
     def prep_for_like_query(self, x):
         """Prepares a value for use in a LIKE query."""
         # http://msdn2.microsoft.com/en-us/library/ms179859.aspx
-        return smart_text(x).replace('\\', '\\\\').replace('[', '[[]').replace('%', '[%]').replace('_', '[_]')
+        return force_text(x).replace('\\', '\\\\').replace('[', '[[]').replace('%', '[%]').replace('_', '[_]')
 
     def prep_for_iexact_query(self, x):
         """
@@ -349,24 +438,23 @@ class DatabaseOperations(BaseDatabaseOperations):
         """
         return x
 
-    def value_to_db_datetime(self, value):
+    def adapt_datetimefield_value(self, value):
         """
-        Transform a datetime value to an object compatible with what is expected
+        Transforms a datetime value to an object compatible with what is expected
         by the backend driver for datetime columns.
         """
         if value is None:
             return None
-        if self.connection._DJANGO_VERSION >= 14 and settings.USE_TZ:
-            if timezone.is_aware(value):
-                # pyodbc donesn't support datetimeoffset
-                value = value.astimezone(timezone.utc)
+        if settings.USE_TZ and timezone.is_aware(value):
+            # pyodbc donesn't support datetimeoffset
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
         if not self.connection.features.supports_microsecond_precision:
             value = value.replace(microsecond=0)
         return value
 
-    def value_to_db_time(self, value):
+    def adapt_timefield_value(self, value):
         """
-        Transform a time value to an object compatible with what is expected
+        Transforms a time value to an object compatible with what is expected
         by the backend driver for time columns.
         """
         if value is None:
@@ -379,67 +467,17 @@ class DatabaseOperations(BaseDatabaseOperations):
                 value = datetime.datetime(1900, 1, 1, value.hour, value.minute, value.second)
         return value
 
-    def year_lookup_bounds(self, value):
+    def year_lookup_bounds_for_date_field(self, value):
         """
         Returns a two-elements list with the lower and upper bound to be used
-        with a BETWEEN operator to query a field value using a year lookup
+        with a BETWEEN operator to query a DateField value using a year
+        lookup.
 
         `value` is an int, containing the looked-up year.
         """
-        first = '%s-01-01 00:00:00'
-        last = '%s-12-31 23:59:59'
-        if self.connection.features.supports_microsecond_precision:
-            first = first + '.0000000'
-            last = last + '.9999999'
-        return [first % value, last % value]
-
-    def value_to_db_decimal(self, value, max_digits, decimal_places):
-        """
-        Transform a decimal.Decimal value to an object compatible with what is
-        expected by the backend driver for decimal (numeric) columns.
-        """
-        if value is None:
-            return None
-        if isinstance(value, decimal.Decimal):
-            context = decimal.getcontext().copy()
-            context.prec = max_digits
-            return "%.*f" % (decimal_places, value.quantize(decimal.Decimal(".1") ** decimal_places, context=context))
+        if self.connection.use_legacy_datetime:
+            bounds = super(DatabaseOperations, self).year_lookup_bounds_for_datetime_field(value)
+            bounds = [dt.replace(microsecond=0) for dt in bounds]
         else:
-            return "%.*f" % (decimal_places, value)
-
-    def convert_values(self, value, field):
-        """
-        Coerce the value returned by the database backend into a consistent
-        type that is compatible with the field type.
-
-        In our case, cater for the fact that SQL Server < 2008 has no
-        separate Date and Time data types.
-        TODO: See how we'll handle this for SQL Server >= 2008
-        """
-        if value is None:
-            return None
-        if field and field.get_internal_type() == 'DateTimeField':
-            return value
-        elif field and field.get_internal_type() == 'DateField':
-            if self.connection.use_legacy_datetime:
-                if isinstance(value, datetime.datetime):
-                    value = value.date() # extract date
-        elif field and field.get_internal_type() == 'TimeField':
-            if self.connection.use_legacy_datetime:
-                if (isinstance(value, datetime.datetime) and value.year == 1900 and value.month == value.day == 1):
-                    value = value.time() # extract time
-        # Some cases (for example when select_related() is used) aren't
-        # caught by the DateField case above and date fields arrive from
-        # the DB as datetime instances.
-        # Implement a workaround stealing the idea from the Oracle
-        # backend. It's not perfect so the same warning applies (i.e. if a
-        # query results in valid date+time values with the time part set
-        # to midnight, this workaround can surprise us by converting them
-        # to the datetime.date Python type).
-        elif isinstance(value, datetime.datetime) and value.hour == value.minute == value.second == value.microsecond == 0:
-            if self.connection.use_legacy_datetime:
-                value = value.date()
-        # Force floats to the correct type
-        elif field and field.get_internal_type() == 'FloatField':
-            value = float(value)
-        return value
+            bounds = super(DatabaseOperations, self).year_lookup_bounds_for_date_field(value)
+        return bounds

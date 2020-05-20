@@ -17,20 +17,22 @@ Microsoft SQL Server and Azure SQL Database.
 Features
 --------
 
--  Supports Django 1.2, 1.3, 1.4, 1.5
--  Supports Microsoft SQL Server 2005, 2008/2008R2, 2012, 2014 and
+-  Supports Django 1.9.12
+-  Supports Microsoft SQL Server 2005, 2008/2008R2, 2012, 2014, 2016 and
    Azure SQL Database
 -  Supports LIMIT+OFFSET and offset w/o LIMIT emulation.
 -  Passes most of the tests of the Django test suite.
--  Compatible with *SQL Server* , *SQL Server Native Client* ,
-   *Micosoft ODBC Driver 11 for SQL Server on Windows* and
-   *FreeTDS* ODBC drivers.
+-  Compatible with
+   `Micosoft ODBC Driver for SQL Server <https://msdn.microsoft.com/library/mt654048(v=sql.1).aspx>`__,
+   `SQL Server Native Client <https://msdn.microsoft.com/library/ms130892(v=sql.120).aspx>`__,
+   `SQL Server <https://msdn.microsoft.com/library/aa968814(vs.85).aspx>`__
+   and `FreeTDS <http://www.freetds.org/>`__ ODBC drivers.
 
 Dependencies
 ------------
 
--  Django 1.2/1.3/1.4/1.5
--  pyodbc 2.1 or newer
+-  Django 1.9.12
+-  pyodbc 3.0 or newer
 
 Installation
 ------------
@@ -39,7 +41,7 @@ Installation
 
 2. Install django-pyodbc-azure ::
 
-    pip install "django-pyodbc-azure<1.1"
+    pip install django-pyodbc-azure
 
 3. Now you can point the ``ENGINE`` setting in the settings file used by
    your Django application or project to the ``'sql_server.pyodbc'``
@@ -50,10 +52,11 @@ Installation
 Configuration
 -------------
 
-The following database-level settings control the behavior of the backend:
-
 Standard Django settings
 ~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following entries in a database-level settings dictionary
+in DATABASES control the behavior of the backend:
 
 -  ENGINE
 
@@ -83,31 +86,32 @@ Standard Django settings
 
    String. Database user password.
 
--  TEST_NAME
+-  AUTOCOMMIT
+
+   Boolean. Set this to False if you want to disable
+   Django's transaction management and implement your own.
+
+and the following entries are also available in the TEST dictionary
+for any given database-level settings dictionary:
+
+-  NAME
 
    String. The name of database to use when running the test suite.
    If the default value (``None``) is used, the test database will use
    the name "test\_" + ``NAME``.
 
--  TEST_COLLATION
+-  COLLATION
 
    String. The collation order to use when creating the test database.
    If the default value (``None``) is used, the test database is assigned
    the default collation of the instance of SQL Server.
 
--  TEST_CREATE
-
-   Boolean. If it is set to ``False``, the test database won't be
-   automatically created at the beginning of the tests and dropped at the end.
-   This is useful not to be charged too much for creating new databases
-   in every test when you run tests with Azure SQL Database.
-
--  TEST_DEPENDENCIES
+-  DEPENDENCIES
 
    String. The creation-order dependencies of the database.
    See the official Django documentation for more details.
 
--  TEST_MIRROR
+-  MIRROR
 
    String. The alias of the database that this database should
    mirror during testing. Default value is ``None``.
@@ -118,14 +122,9 @@ OPTIONS
 
 Dictionary. Current available keys are:
 
--  autocommit
-
-   Boolean. Indicates if pyodbc should direct the ODBC driver to
-   activate the autocommit feature. Default value is ``False``.
-
 -  driver
 
-   String. ODBC Driver to use (``"SQL Server Native Client 11.0"`` etc).
+   String. ODBC Driver to use (``"ODBC Driver 11 for SQL Server"`` etc).
    See http://msdn.microsoft.com/en-us/library/ms130892.aspx. Default is
    ``"SQL Server"`` on Windows and ``"FreeTDS"`` on other platforms.
 
@@ -176,16 +175,27 @@ Dictionary. Current available keys are:
    (the same behavior as the original ``django-pyodbc``). Otherwise, they
    are mapped to new dedicated data types (``date``, ``time``, ``datetime2``).
    Default value is ``False``, and note that the feature is always activated
-   when you use SQL Server 2005, or the outdated ODBC drivers
-   (``"FreeTDS"``/``"SQL Server"``/``"SQL Native Client"``).
+   when you use SQL Server 2005, or the outdated ODBC drivers (``"FreeTDS"``
+   with TDS protocol v7.2 or earlier/``"SQL Server"``/``"SQL Native Client"``).
 
 -  connection_timeout
 
    Integer. Sets the timeout in seconds for the database connection process.
    Default value is ``0`` which disables the timeout.
 
+-  connection_retries
+
+   Integer. Sets the times to retry the database connection process.
+   Default value is ``5``.
+
+-  connection_retry_backoff_time
+
+   Integer. Sets the back off time in seconds for reries of
+   the database connection process. Default value is ``5``.
+
 backend-specific settings
 ~~~~~~~~~~~~~~~~~~~~~~~~~
+
 The following project-level settings also control the behavior of the backend:
 
 -  DATABASE_CONNECTION_POOLING
@@ -210,13 +220,30 @@ Here is an example of the database settings:
             'PORT': '',
 
             'OPTIONS': {
-                'driver': 'SQL Server Native Client 11.0',
+                'driver': 'ODBC Driver 11 for SQL Server',
             },
         },
     }
     
     # set this to False if you want to turn off pyodbc's connection pooling
     DATABASE_CONNECTION_POOLING = False
+
+Limitations
+-----------
+
+The following features are currently not supported:
+
+- Altering a model field from or to AutoField at migration
+
+Notice
+------
+
+This version of *django-pyodbc-azure* only supports Django 1.9.
+If you want to use it on older versions of Django,
+specify an appropriate version number (1.8.x.x for Django 1.8)
+at installation like this: ::
+
+    pip install "django-pyodbc-azure<1.9"
 
 License
 -------
