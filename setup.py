@@ -16,7 +16,7 @@ CLASSIFIERS=[
 ]
 
 setup(
-    name='zipline-django-pyodbc',
+    name='zipline-django-pyodbc-azure',
     version='1.9.12.0',
     description='Django backend for Microsoft SQL Server using pyodbc forked from django-pyodbc-azure',
     long_description=open('README.rst').read(),
