@@ -261,14 +261,30 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
             actions.append(self._alter_column_default_sql(model, old_field, new_field))
         # Nullability change?
         if old_field.null != new_field.null:
-            fragment = self._alter_column_null_sql(model, old_field, new_field)
-            if fragment:
-                null_actions.append(fragment)
-                if not new_field.null:
-                    # Drop unique constraint, SQL Server requires explicit deletion
-                    self._delete_unique_constraints(model, old_field, new_field, strict)
-                    # Drop indexes, SQL Server requires explicit deletion
-                    self._delete_indexes(model, old_field, new_field)
+            if (self.connection.features.interprets_empty_strings_as_nulls and
+                    new_field.get_internal_type() in ("CharField", "TextField")):
+                # The field is nullable in the database anyway, leave it alone
+                pass
+            elif new_field.null:
+                null_actions.append((
+                    self.sql_alter_column_null % {
+                        "column": self.quote_name(new_field.column),
+                        "type": new_type,
+                    },
+                    [],
+                ))
+            else:
+                null_actions.append((
+                    self.sql_alter_column_not_null % {
+                        "column": self.quote_name(new_field.column),
+                        "type": new_type,
+                    },
+                    [],
+                ))
+                # Drop unique constraint, SQL Server requires explicit deletion
+                self._delete_unique_constraints(model, old_field, new_field, strict)
+                # Drop indexes, SQL Server requires explicit deletion
+                self._delete_indexes(model, old_field, new_field)
         # Only if we have a default and there is a change from NULL to NOT NULL
         four_way_default_alteration = (
             new_field.has_default() and
@@ -333,9 +349,7 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         if (not old_field.db_index or old_field.unique) and new_field.db_index and not new_field.unique:
             self.execute(self._create_index_sql(model, [new_field]))
         # Restore an index, SQL Server requires explicit restoration
-        if (old_type != new_type or (old_field.null and not new_field.null)) and (
-            old_field.column == new_field.column
-        ):
+        if old_type != new_type or (old_field.null and not new_field.null):
             unique_columns = []
             if old_field.unique and new_field.unique:
                 unique_columns.append([old_field.column])
