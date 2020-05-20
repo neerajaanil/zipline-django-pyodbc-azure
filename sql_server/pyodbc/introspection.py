@@ -7,7 +7,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
     # Map type codes to Django Field types.
     data_types_reverse = {
         SQL_AUTOFIELD:                  'AutoField',
-        Database.SQL_BIGINT:            'IntegerField',
+        Database.SQL_BIGINT:            'BigIntegerField',
         #Database.SQL_BINARY:            ,
         Database.SQL_BIT:               'BooleanField',
         Database.SQL_CHAR:              'CharField',
@@ -120,18 +120,30 @@ WHERE a.TABLE_NAME = %s AND a.CONSTRAINT_TYPE = 'FOREIGN KEY'"""
         Returns a dictionary of fieldname -> infodict for the given table,
         where each infodict is in the format:
             {'primary_key': boolean representing whether it's the primary key,
-             'unique': boolean representing whether it's a unique index,
-             'db_index': boolean representing whether it's a non-unique index}
+             'unique': boolean representing whether it's a unique index}
         """
         # CONSTRAINT_COLUMN_USAGE: http://msdn2.microsoft.com/en-us/library/ms174431.aspx
         # TABLE_CONSTRAINTS: http://msdn2.microsoft.com/en-us/library/ms181757.aspx
 
-        pk_uk_sql = """
+        if self.connection._DJANGO_VERSION < 14:
+            pk_uk_sql = """
 SELECT b.COLUMN_NAME, a.CONSTRAINT_TYPE
 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS a
 INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS b
   ON a.CONSTRAINT_NAME = b.CONSTRAINT_NAME AND a.TABLE_NAME = b.TABLE_NAME
 WHERE a.TABLE_NAME = %s AND (CONSTRAINT_TYPE = 'PRIMARY KEY' OR CONSTRAINT_TYPE = 'UNIQUE')"""
+        else:
+            pk_uk_sql = """
+SELECT d.COLUMN_NAME, c.CONSTRAINT_TYPE FROM (
+SELECT a.CONSTRAINT_NAME, a.CONSTRAINT_TYPE
+FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS a
+INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS b
+  ON a.CONSTRAINT_NAME = b.CONSTRAINT_NAME AND a.TABLE_NAME = b.TABLE_NAME
+WHERE a.TABLE_NAME = %s AND (CONSTRAINT_TYPE = 'PRIMARY KEY' OR CONSTRAINT_TYPE = 'UNIQUE')
+GROUP BY a.CONSTRAINT_TYPE, a.CONSTRAINT_NAME
+HAVING(COUNT(a.CONSTRAINT_NAME)) = 1) AS c
+INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS d
+  ON c.CONSTRAINT_NAME = d.CONSTRAINT_NAME"""
 
         field_names = [item[0] for item in self.get_table_description(cursor, table_name, identity_check=False)]
         indexes, results = {}, {}
@@ -159,17 +171,34 @@ AND ix.is_primary_key = 0
 AND ix.is_unique_constraint = 0
 AND t.name = %s"""
 
-        if self.connection.ops.sql_server_ver >= 2005:
-            cursor.execute(ix_sql, (table_name,))
-            for column in [r[0] for r in cursor.fetchall()]:
-                if column not in results:
-                    results[column] = 'IX'
+        cursor.execute(ix_sql, (table_name,))
+        for column in [r[0] for r in cursor.fetchall()]:
+            if column not in results:
+                results[column] = 'IX'
 
         for field in field_names:
             val = results.get(field, None)
-            indexes[field] = dict(primary_key=(val=='PRIMARY KEY'), unique=(val=='UNIQUE'), db_index=(val=='IX'))
+            if self.connection._DJANGO_VERSION < 14 or val:
+                indexes[field] = dict(primary_key=(val=='PRIMARY KEY'), unique=(val=='UNIQUE'))
 
         return indexes
+
+    def get_key_columns(self, cursor, table_name):
+        """
+        Returns a list of (column_name, referenced_table_name, referenced_column_name) for all
+        key columns in given table.
+        """
+        key_columns = []
+        cursor.execute("""
+            SELECT c.name AS column_name, rt.name AS referenced_table_name, rc.name AS referenced_column_name
+            FROM sys.foreign_key_columns fk
+            INNER JOIN sys.tables t ON t.object_id = fk.parent_object_id
+            INNER JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id = fk.parent_column_id
+            INNER JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+            INNER JOIN sys.columns rc ON rc.object_id = rt.object_id AND rc.column_id = fk.referenced_column_id
+            WHERE t.name = %s""", [table_name])
+        key_columns.extend([tuple(row) for row in cursor.fetchall()])
+        return key_columns
 
     #def get_collations_list(self, cursor):
     #    """

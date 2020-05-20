@@ -1,191 +1,19 @@
 from django.db.models.sql import compiler
-from datetime import datetime
-
-REV_ODIR = {
-    'ASC': 'DESC',
-    'DESC': 'ASC'
-}
-
-SQL_SERVER_8_LIMIT_QUERY = \
-"""SELECT *
-FROM (
-  SELECT TOP %(limit)s *
-  FROM (
-    %(orig_sql)s
-    ORDER BY %(ord)s
-  ) AS %(table)s
-  ORDER BY %(rev_ord)s
-) AS %(table)s
-ORDER BY %(ord)s"""
-
-SQL_SERVER_8_NO_LIMIT_QUERY = \
-"""SELECT *
-FROM %(table)s
-WHERE %(key)s NOT IN (
-  %(orig_sql)s
-  ORDER BY %(ord)s
-)"""
-
-# Strategies for handling limit+offset emulation:
-USE_ROW_NUMBER = 0 # For SQL Server >= 2005
-USE_TOP_HMARK = 1 # For SQL Server 2000 when both limit and offset are provided
-USE_TOP_LMARK = 2 # For SQL Server 2000 when offset but no limit is provided
+                                            
+from sql_server.pyodbc.aggregates import AggregateWrapper
+from sql_server.pyodbc.compat import zip_longest
 
 
 class SQLCompiler(compiler.SQLCompiler):
-    
+
     def resolve_columns(self, row, fields=()):
-        index_start = len(self.query.extra_select.keys())
+        index_start = len(list(self.query.extra_select.keys()))
         values = [self.query.convert_values(v, None, connection=self.connection) for v in row[:index_start]]
-        for value, field in map(None, row[index_start:], fields):
-            values.append(self.query.convert_values(value, field, connection=self.connection))
+        for value, field in zip_longest(row[index_start:], fields):
+            if field:
+                value = self.query.convert_values(value, field, connection=self.connection)
+            values.append(value)
         return tuple(values)
-
-    def modify_query(self, strategy, ordering, out_cols):
-        """
-        Helper method, called from _as_sql()
-
-        Sets the value of the self._ord and self.default_reverse_ordering
-        attributes.
-        Can modify the values of the out_cols list argument and the
-        self.query.ordering_aliases attribute.
-        """
-        self.default_reverse_ordering = False
-        self._ord = []
-        cnt = 0
-        extra_select_aliases = [k.strip('[]') for k in self.query.extra_select.keys()]
-        for ord_spec_item in ordering:
-            if ord_spec_item.endswith(' ASC') or ord_spec_item.endswith(' DESC'):
-                parts = ord_spec_item.split()
-                col, odir = ' '.join(parts[:-1]), parts[-1]
-                if col not in self.query.ordering_aliases and col.strip('[]') not in extra_select_aliases:
-                    if col.isdigit():
-                        cnt += 1
-                        n = int(col)-1
-                        alias = 'OrdAlias%d' % cnt
-                        out_cols[n] = '%s AS [%s]' % (out_cols[n], alias)
-                        self._ord.append((alias, odir))
-                    elif col in out_cols:
-                        if strategy == USE_TOP_HMARK:
-                            cnt += 1
-                            n = out_cols.index(col)
-                            alias = 'OrdAlias%d' % cnt
-                            out_cols[n] = '%s AS %s' % (col, alias)
-                            self._ord.append((alias, odir))
-                        else:
-                            self._ord.append((col, odir))
-                    elif strategy == USE_TOP_HMARK:
-                        # Special case: '_order' column created by Django
-                        # when Meta.order_with_respect_to is used
-                        if col.split('.')[-1] == '[_order]' and odir == 'DESC':
-                            self.default_reverse_ordering = True
-                        cnt += 1
-                        alias = 'OrdAlias%d' % cnt
-                        self._ord.append((alias, odir))
-                        self.query.ordering_aliases.append('%s AS [%s]' % (col, alias))
-                    else:
-                        self._ord.append((col, odir))
-                else:
-                    self._ord.append((col, odir))
-
-        if strategy == USE_ROW_NUMBER and not self._ord and 'RAND()' in ordering:
-            self._ord.append(('RAND()',''))
-        if strategy == USE_TOP_HMARK and not self._ord:
-            # XXX:
-            #meta = self.get_meta()
-            meta = self.query.model._meta
-            qn = self.quote_name_unless_alias
-            pk_col = '%s.%s' % (qn(meta.db_table), qn(meta.pk.db_column or meta.pk.column))
-            if pk_col not in out_cols:
-                out_cols.append(pk_col)
-
-    def _as_sql(self, strategy):
-        """
-        Helper method, called from as_sql()
-        Similar to django/db/models/sql/query.py:Query.as_sql() but without
-        the ordering and limits code.
-
-        Returns SQL that hasn't an order-by clause.
-        """
-        # get_columns needs to be called before get_ordering to populate
-        # _select_alias.
-        out_cols = self.get_columns(True)
-        ordering, ordering_group_by = self.get_ordering()
-        if strategy == USE_ROW_NUMBER:
-            if not ordering:
-                meta = self.query.get_meta()
-                qn = self.quote_name_unless_alias
-                # Special case: pk not in out_cols, use random ordering. 
-                #
-                if '%s.%s' % (qn(meta.db_table), qn(meta.pk.db_column or meta.pk.column)) not in self.get_columns():
-                    ordering = ['RAND()']
-                    # XXX: Maybe use group_by field for ordering?
-                    #if self.group_by:
-                        #ordering = ['%s.%s ASC' % (qn(self.group_by[0][0]),qn(self.group_by[0][1]))]
-                else:
-                    ordering = ['%s.%s ASC' % (qn(meta.db_table), qn(meta.pk.db_column or meta.pk.column))]
-
-        if strategy in (USE_TOP_HMARK, USE_ROW_NUMBER):
-            self.modify_query(strategy, ordering, out_cols)
-
-        if strategy == USE_ROW_NUMBER:
-            ord = ', '.join(['%s %s' % pair for pair in self._ord])
-            self.query.ordering_aliases.append('(ROW_NUMBER() OVER (ORDER BY %s)) AS [rn]' % ord)
-
-        # This must come after 'select' and 'ordering' -- see docstring of
-        # get_from_clause() for details.
-        from_, f_params = self.get_from_clause()
-
-        qn = self.quote_name_unless_alias
-        where, w_params = self.query.where.as_sql(qn, self.connection)
-        having, h_params = self.query.having.as_sql(qn, self.connection)
-        params = []
-        for val in self.query.extra_select.itervalues():
-            params.extend(val[1])
-
-        result = ['SELECT']
-        if self.query.distinct:
-            result.append('DISTINCT')
-
-        if strategy == USE_TOP_LMARK:
-            # XXX:
-            #meta = self.get_meta()
-            meta = self.query.model._meta
-            result.append('TOP %s %s' % (self.query.low_mark, self.quote_name_unless_alias(meta.pk.db_column or meta.pk.column)))
-        else:
-            if strategy == USE_TOP_HMARK and self.query.high_mark is not None:
-                result.append('TOP %s' % self.query.high_mark)
-            result.append(', '.join(out_cols + self.query.ordering_aliases))
-
-        result.append('FROM')
-        result.extend(from_)
-        params.extend(f_params)
-
-        if where:
-            result.append('WHERE %s' % where)
-            params.extend(w_params)
-
-        grouping, gb_params = self.get_grouping()
-        if grouping:
-            if ordering:
-                # If the backend can't group by PK (i.e., any database
-                # other than MySQL), then any fields mentioned in the
-                # ordering clause needs to be in the group by clause.
-                if not self.connection.features.allows_group_by_pk:
-                    for col, col_params in ordering_group_by:
-                        if col not in grouping:
-                            grouping.append(str(col))
-                            gb_params.extend(col_params)
-            else:
-                ordering = self.connection.ops.force_no_ordering()
-            result.append('GROUP BY %s' % ', '.join(grouping))
-            params.extend(gb_params)
-
-        if having:
-            result.append('HAVING %s' % having)
-            params.extend(h_params)
-
-        return ' '.join(result), tuple(params)
 
     def as_sql(self, with_limits=True, with_col_aliases=False):
         """
@@ -195,100 +23,190 @@ class SQLCompiler(compiler.SQLCompiler):
         If 'with_limits' is False, any limit/offset information is not included
         in the query.
         """
-        # The do_offset flag indicates whether we need to construct
-        # the SQL needed to use limit/offset w/SQL Server.
-        do_offset = with_limits and (self.query.high_mark is not None or self.query.low_mark != 0)
+        if with_limits and self.query.low_mark == self.query.high_mark:
+            return '', ()
 
-        # If no offsets, just return the result of the base class
-        # `as_sql`.
-        if not do_offset:
-            return super(SQLCompiler, self).as_sql(with_limits=False,
-                                                      with_col_aliases=with_col_aliases)
-        # Shortcut for the corner case when high_mark value is 0:
-        if self.query.high_mark == 0:
-            return "", ()
+        self._wrap_aggregates()
 
         self.pre_sql_setup()
-        # XXX:
-        #meta = self.get_meta()
-        meta = self.query.model._meta
+
+        # The do_offset flag indicates whether we need to construct
+        # the SQL needed to use limit/offset w/SQL Server.
+        high_mark = self.query.high_mark
+        low_mark = self.query.low_mark
+        do_limit = with_limits and high_mark is not None
+        do_offset = with_limits and low_mark != 0
+        # SQL Server 2012 or newer supports OFFSET/FETCH clause
+        supports_offset_clause = self.connection.ops.sql_server_ver >= 2012
+        do_offset_emulation = do_offset and not supports_offset_clause
+
+        # After executing the query, we must get rid of any joins the query
+        # setup created. So, take note of alias counts before the query ran.
+        # However we do not want to get rid of stuff done in pre_sql_setup(),
+        # as the pre_sql_setup will modify query state in a way that forbids
+        # another run of it.
+        if self.connection._DJANGO_VERSION >= 14:
+            self.refcounts_before = self.query.alias_refcount.copy()
+        out_cols = self.get_columns(with_col_aliases or do_offset_emulation)
+        ordering, ordering_group_by, offset_params = \
+            self._get_ordering(out_cols, not do_offset_emulation)
+
+        # This must come after 'select' and 'ordering' -- see docstring of
+        # get_from_clause() for details.
+        from_, f_params = self.get_from_clause()
+
         qn = self.quote_name_unless_alias
-        fallback_ordering = '%s.%s' % (qn(meta.db_table), qn(meta.pk.db_column or meta.pk.column))
 
-        # SQL Server 2000, offset+limit case
-        if self.connection.ops.sql_server_ver < 2005 and self.query.high_mark is not None:
-            orig_sql, params = self._as_sql(USE_TOP_HMARK)
-            if self._ord:
-                ord = ', '.join(['%s %s' % pair for pair in self._ord])
-                rev_ord = ', '.join(['%s %s' % (col, REV_ODIR[odir]) for col, odir in self._ord])
-            else:
-                if not self.default_reverse_ordering:
-                    ord = '%s ASC' % fallback_ordering
-                    rev_ord = '%s DESC' % fallback_ordering
+        where, w_params = self.query.where.as_sql(qn=qn, connection=self.connection)
+        having, h_params = self.query.having.as_sql(qn=qn, connection=self.connection)
+        params = []
+        for val in self.query.extra_select.values():
+            params.extend(val[1])
+
+        result = ['SELECT']
+
+        if self.query.distinct:
+            result.append('DISTINCT')
+
+        if do_offset:
+            if not ordering:
+                meta = self.query.get_meta()
+                qn = self.quote_name_unless_alias
+                pk = '%s.%s' % (qn(meta.db_table), qn(meta.pk.db_column or meta.pk.column))
+                # Special case: pk not in out_cols, use random ordering.
+                if not pk in out_cols:
+                    ordering = [self.connection.ops.random_function_sql()]
+                # XXX: Maybe use group_by field for ordering?
+                #if self.group_by:
+                    #ordering = ['%s.%s ASC' % (qn(self.group_by[0][0]),qn(self.group_by[0][1]))]
                 else:
-                    ord = '%s DESC' % fallback_ordering
-                    rev_ord = '%s ASC' % fallback_ordering
-            sql = SQL_SERVER_8_LIMIT_QUERY % {
-                'limit': self.query.high_mark - self.query.low_mark,
-                'orig_sql': orig_sql,
-                'ord': ord,
-                'rev_ord': rev_ord,
-                # XXX:
-                'table': qn(meta.db_table),
-            }
-            return sql, params
+                    ordering = ['%s ASC' % pk]
+            if do_offset_emulation:
+                order = ', '.join(ordering)
+                self.query.ordering_aliases.append('(ROW_NUMBER() OVER (ORDER BY %s)) AS [rn]' % order)
+                ordering = self.connection.ops.force_no_ordering()
+        elif do_limit:
+            result.append('TOP %d' % high_mark)
 
-        # SQL Server 2005
-        if self.connection.ops.sql_server_ver >= 2005:
-            sql, params = self._as_sql(USE_ROW_NUMBER)
-            
+        result.append(', '.join(out_cols + self.query.ordering_aliases))
+
+        params.extend(offset_params)
+
+        result.append('FROM')
+        result.extend(from_)
+        params.extend(f_params)
+
+        if self.connection.features.has_select_for_update and self.query.select_for_update:
+            # If we've been asked for a NOWAIT query but the backend does not support it,
+            # raise a DatabaseError otherwise we could get an unexpected deadlock.
+            nowait = self.query.select_for_update_nowait
+            result.append(self.connection.ops.for_update_sql(nowait=nowait))
+
+        if where:
+            result.append('WHERE %s' % where)
+            params.extend(w_params)
+
+        if self.connection._DJANGO_VERSION >= 15:
+            grouping, gb_params = self.get_grouping(ordering_group_by)
+        else:
+            grouping, gb_params = self.get_grouping()
+            if grouping and ordering:
+                # If the backend can't group by PK (i.e., any database
+                # other than MySQL), then any fields mentioned in the
+                # ordering clause needs to be in the group by clause.
+                if not self.connection.features.allows_group_by_pk:
+                    for col, col_params in ordering_group_by:
+                        if col not in grouping:
+                            grouping.append(str(col))
+                            gb_params.extend(col_params)
+        if grouping:
+            if not ordering:
+                ordering = self.connection.ops.force_no_ordering()
+            result.append('GROUP BY %s' % ', '.join(grouping))
+            params.extend(gb_params)
+
+        if having:
+            result.append('HAVING %s' % having)
+            params.extend(h_params)
+
+        if ordering and not with_col_aliases:
+            result.append('ORDER BY %s' % ', '.join(ordering))
+            if do_offset and not do_offset_emulation:
+                result.append('OFFSET %d ROWS' % low_mark)
+                if do_limit:
+                    result.append('FETCH FIRST %d ROWS ONLY' % (high_mark - low_mark))
+
+        if do_offset_emulation:
             # Construct the final SQL clause, using the initial select SQL
             # obtained above.
-            result = ['SELECT * FROM (%s) AS X' % sql]
-
+            result = ['SELECT * FROM (%s) AS X WHERE X.rn' % ' '.join(result)]
             # Place WHERE condition on `rn` for the desired range.
-            if self.query.high_mark is None:
-                self.query.high_mark = 9223372036854775807
-            result.append('WHERE X.rn BETWEEN %d AND %d' % (self.query.low_mark+1, self.query.high_mark))
+            if do_limit:
+                result.append('BETWEEN %d AND %d' % (low_mark+1, high_mark))
+            else:
+                result.append('>= %d' % (low_mark+1))
+            result.append('ORDER BY X.rn')
 
-            return ' '.join(result), params
+        # Finally do cleanup - get rid of the joins we created above.
+        if self.connection._DJANGO_VERSION >= 14:
+            self.query.reset_refcounts(self.refcounts_before)
 
-        # SQL Server 2000, offset without limit case
-        # get_columns needs to be called before get_ordering to populate
-        # select_alias.
-        self.get_columns(with_col_aliases)
+        return ' '.join(result), tuple(params)
+
+    def _get_ordering(self, out_cols, allow_aliases=True):
+        # SQL Server doesn't support grouping by column number
         ordering, ordering_group_by = self.get_ordering()
-        if ordering:
-            ord = ', '.join(ordering)
-        else:
-            # We need to define an ordering clause since none was provided
-            ord = fallback_ordering
-        orig_sql, params = self._as_sql(USE_TOP_LMARK)
-        sql = SQL_SERVER_8_NO_LIMIT_QUERY % {
-            'orig_sql': orig_sql,
-            'ord': ord,
-            'table': qn(meta.db_table),
-            'key': qn(meta.pk.db_column or meta.pk.column),
-        }
-        return sql, params
+        grouping = []
+        for group_by in ordering_group_by:
+            try:
+                col_index = int(group_by[0]) - 1
+                grouping.append((out_cols[col_index], group_by[1]))
+            except ValueError:
+                grouping.append(group_by)
+        # value_expression in OVER clause cannot refer to
+        # expressions or aliases in the select list. See:
+        # http://msdn.microsoft.com/en-us/library/ms189461.aspx
+        offset_params = []
+        if not allow_aliases:
+            keys = self.query.extra.keys()
+            for i in range(len(ordering)):
+                order_col, order_dir = ordering[i].split()
+                order_col = order_col.strip('[]')
+                if order_col in keys:
+                    ex = self.query.extra[order_col]
+                    ordering[i] = '%s %s' % (ex[0], order_dir)
+                    offset_params.extend(ex[1])
+        return ordering, grouping, offset_params
+
+    def _wrap_aggregates(self):
+        for alias, aggregate in self.query.aggregate_select.items():
+            self.query.aggregate_select[alias] = AggregateWrapper(aggregate)
 
 
 class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
-    def as_sql(self):
+
+    def as_sql_legacy(self):
         # We don't need quote_name_unless_alias() here, since these are all
         # going to be column names (so we can avoid the extra overhead).
         qn = self.connection.ops.quote_name
         opts = self.query.model._meta
-        result = ['INSERT INTO %s' % qn(opts.db_table)]
+        returns_id = bool(self.return_id and
+                          self.connection.features.can_return_id_from_insert)
+
+        if returns_id:
+            result = ['SET NOCOUNT ON']
+        else:
+            result = []
+
+        result.append('INSERT INTO %s' % qn(opts.db_table))
         result.append('(%s)' % ', '.join([qn(c) for c in self.query.columns]))
-        if self.return_id and self.connection.features.can_return_id_from_insert:
-            output = 'OUTPUT inserted.%s' % qn(opts.pk.column)
-            result.append(output)
+
         values = [self.placeholder(*v) for v in self.query.values]
         result.append('VALUES (%s)' % ', '.join(values))
+
         params = self.query.params
         sql = ' '.join(result)
-        
+
         meta = self.query.get_meta()
         if meta.has_auto_field:
             # db_column is None if not explicitly specified by model field
@@ -296,22 +214,89 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
 
             if auto_field_column in self.query.columns:
                 quoted_table = self.connection.ops.quote_name(meta.db_table)
+
                 if len(self.query.columns) == 1 and not params:
-                    sql = "INSERT INTO %s DEFAULT VALUES" % quoted_table
+                    sql = ''
+                    if returns_id:
+                        sql = 'SET NOCOUNT ON '
+                    sql += "INSERT INTO %s DEFAULT VALUES" % quoted_table
                 else:
-                    sql = "SET IDENTITY_INSERT %s ON;\n%s;\nSET IDENTITY_INSERT %s OFF" % \
+                    sql = "SET IDENTITY_INSERT %s ON; %s; SET IDENTITY_INSERT %s OFF" % \
                         (quoted_table, sql, quoted_table)
+
+        if returns_id:
+            sql += '; SELECT CAST(SCOPE_IDENTITY() AS BIGINT)'
+
         return sql, params
+
+    def as_sql(self):
+        if self.connection._DJANGO_VERSION < 14:
+            return self.as_sql_legacy()
+
+        can_return_id = self.connection.features.can_return_id_from_insert
+        self.connection.features.can_return_id_from_insert = False
+
+        items = super(SQLInsertCompiler, self).as_sql()
+
+        self.connection.features.can_return_id_from_insert = can_return_id
+
+        opts = self.query.model._meta
+        returns_id = bool(self.return_id and
+                          self.connection.features.can_return_id_from_insert)
+
+        has_fields = bool(self.query.fields)
+        if has_fields:
+            fields = self.query.fields 
+        else:
+            fields = [opts.pk]
+        columns = [f.column for f in fields]
+
+        if returns_id:
+            items = [['SET NOCOUNT ON ' + x[0], x[1]] for x in items]
+
+        # This section deals with specifically setting the primary key,
+        # or using default values if necessary
+        meta = self.query.get_meta()
+        if meta.has_auto_field:
+            # db_column is None if not explicitly specified by model field
+            auto_field_column = meta.auto_field.db_column or meta.auto_field.column
+
+            out = []
+            for sql, params in items:
+                if auto_field_column in columns:
+                    quoted_table = self.connection.ops.quote_name(meta.db_table)
+                    if not has_fields:
+                        # If there are no fields specified in the insert..
+                        sql = ''
+                        if returns_id:
+                            sql = 'SET NOCOUNT ON '
+                        sql += "INSERT INTO %s DEFAULT VALUES" % quoted_table
+                    else:
+                        sql = "SET IDENTITY_INSERT %s ON; %s; SET IDENTITY_INSERT %s OFF"% \
+                            (quoted_table, sql, quoted_table)
+                out.append([sql, params])
+            items = out
+
+        if returns_id:
+            items = [[x[0] + '; SELECT CAST(SCOPE_IDENTITY() AS BIGINT)', x[1]] for x in items]
+
+        return items
 
 
 class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
     pass
 
 class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):
-    pass
+    def as_sql(self):
+        sql, params = super(SQLUpdateCompiler, self).as_sql()
+        if sql:
+            sql = '; '.join(['SET NOCOUNT OFF', sql])
+        return sql, params
 
 class SQLAggregateCompiler(compiler.SQLAggregateCompiler, SQLCompiler):
-    pass
+    def as_sql(self, qn=None):
+        self._wrap_aggregates()
+        return super(SQLAggregateCompiler, self).as_sql(qn=qn)
 
 class SQLDateCompiler(compiler.SQLDateCompiler, SQLCompiler):
     pass
