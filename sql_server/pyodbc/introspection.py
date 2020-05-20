@@ -1,20 +1,19 @@
-from collections import namedtuple
-
 import pyodbc as Database
 
 from django.db.backends.base.introspection import (
     BaseDatabaseIntrospection, FieldInfo, TableInfo,
 )
-
-FieldInfo = namedtuple('FieldInfo', FieldInfo._fields + ('default',))
+from django.db.models.indexes import Index
 
 SQL_AUTOFIELD = -777555
+SQL_BIGAUTOFIELD = -777444
 
 
 class DatabaseIntrospection(BaseDatabaseIntrospection):
     # Map type codes to Django Field types.
     data_types_reverse = {
         SQL_AUTOFIELD:                  'AutoField',
+        SQL_BIGAUTOFIELD:               'BigAutoField',
         Database.SQL_BIGINT:            'BigIntegerField',
         #Database.SQL_BINARY:            ,
         Database.SQL_BIT:               'BooleanField',
@@ -44,7 +43,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
     ignored_tables = []
 
     def get_field_type(self, data_type, description):
-        field_type = super(DatabaseIntrospection, self).get_field_type(data_type, description)
+        field_type = super().get_field_type(data_type, description)
         # the max nvarchar length is described as 0 or 2**30-1
         # (it depends on the driver)
         size = description.internal_size
@@ -60,7 +59,7 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         """
         Returns a list of table and view names in the current database.
         """
-        sql = 'SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES'
+        sql = 'SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = SCHEMA_NAME()'
         cursor.execute(sql)
         types = {'BASE TABLE': 't', 'VIEW': 'v'}
         return [TableInfo(row[0], types.get(row[1]))
@@ -87,8 +86,11 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         If set to True, the function will check each of the table's fields for the
         IDENTITY property (the IDENTITY property is the MSSQL equivalent to an AutoField).
 
-        When a field is found with an IDENTITY property, it is given a custom field number
+        When an integer field is found with an IDENTITY property, it is given a custom field number
         of SQL_AUTOFIELD, which maps to the 'AutoField' value in the DATA_TYPES_REVERSE dict.
+
+        When a bigint field is found with an IDENTITY property, it is given a custom field number
+        of SQL_BIGAUTOFIELD, which maps to the 'BigAutoField' value in the DATA_TYPES_REVERSE dict.
         """
 
         # map pyodbc's cursor.columns to db-api cursor description
@@ -96,11 +98,25 @@ class DatabaseIntrospection(BaseDatabaseIntrospection):
         items = []
         for column in columns:
             if identity_check and self._is_auto_field(cursor, table_name, column[0]):
-                column[1] = SQL_AUTOFIELD
+                if column[1] == Database.SQL_BIGINT:
+                    column[1] = SQL_BIGAUTOFIELD
+                else:
+                    column[1] = SQL_AUTOFIELD
             if column[1] == Database.SQL_WVARCHAR and column[3] < 4000:
                 column[1] = Database.SQL_WCHAR
             items.append(FieldInfo(*column))
         return items
+
+    def get_sequences(self, cursor, table_name, table_fields=()):
+        cursor.execute("""
+            SELECT c.name FROM sys.columns c
+            INNER JOIN sys.tables t ON c.object_id = t.object_id
+            WHERE t.schema_id = SCHEMA_ID() AND t.name = %s AND c.is_identity = 1""",
+            [table_name])
+        # SQL Server allows only one identity column per table
+        # https://docs.microsoft.com/en-us/sql/t-sql/statements/create-table-transact-sql-identity-property
+        row = cursor.fetchone()
+        return [{'table': table_name, 'column': row[0]}] if row else []
 
     def get_relations(self, cursor, table_name):
         """
@@ -118,76 +134,16 @@ SELECT e.COLUMN_NAME AS column_name,
   d.COLUMN_NAME AS referenced_column_name
 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS a
 INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS AS b
-  ON a.CONSTRAINT_NAME = b.CONSTRAINT_NAME
+  ON a.CONSTRAINT_NAME = b.CONSTRAINT_NAME AND a.TABLE_SCHEMA = b.CONSTRAINT_SCHEMA
 INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_TABLE_USAGE AS c
-  ON b.UNIQUE_CONSTRAINT_NAME = c.CONSTRAINT_NAME
+  ON b.UNIQUE_CONSTRAINT_NAME = c.CONSTRAINT_NAME AND b.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA
 INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS d
-  ON c.CONSTRAINT_NAME = d.CONSTRAINT_NAME
+  ON c.CONSTRAINT_NAME = d.CONSTRAINT_NAME AND c.CONSTRAINT_SCHEMA = d.CONSTRAINT_SCHEMA
 INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS e
-  ON a.CONSTRAINT_NAME = e.CONSTRAINT_NAME
-WHERE a.TABLE_NAME = %s AND a.CONSTRAINT_TYPE = 'FOREIGN KEY'"""
+  ON a.CONSTRAINT_NAME = e.CONSTRAINT_NAME AND a.TABLE_SCHEMA = e.TABLE_SCHEMA
+WHERE a.TABLE_SCHEMA = SCHEMA_NAME() AND a.TABLE_NAME = %s AND a.CONSTRAINT_TYPE = 'FOREIGN KEY'"""
         cursor.execute(sql, (table_name,))
         return dict([[item[0], (item[2], item[1])] for item in cursor.fetchall()])
-
-    def get_indexes(self, cursor, table_name):
-        """
-        Returns a dictionary of fieldname -> infodict for the given table,
-        where each infodict is in the format:
-            {'primary_key': boolean representing whether it's the primary key,
-             'unique': boolean representing whether it's a unique index}
-        """
-        # CONSTRAINT_COLUMN_USAGE: http://msdn2.microsoft.com/en-us/library/ms174431.aspx
-        # TABLE_CONSTRAINTS: http://msdn2.microsoft.com/en-us/library/ms181757.aspx
-
-        pk_uk_sql = """
-SELECT d.COLUMN_NAME, c.CONSTRAINT_TYPE FROM (
-SELECT a.CONSTRAINT_NAME, a.CONSTRAINT_TYPE
-FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS a
-INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS b
-  ON a.CONSTRAINT_NAME = b.CONSTRAINT_NAME AND a.TABLE_NAME = b.TABLE_NAME
-WHERE a.TABLE_NAME = %s AND (CONSTRAINT_TYPE = 'PRIMARY KEY' OR CONSTRAINT_TYPE = 'UNIQUE')
-GROUP BY a.CONSTRAINT_TYPE, a.CONSTRAINT_NAME
-HAVING(COUNT(a.CONSTRAINT_NAME)) = 1) AS c
-INNER JOIN INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE AS d
-  ON c.CONSTRAINT_NAME = d.CONSTRAINT_NAME"""
-
-        field_names = [item[0] for item in self.get_table_description(cursor, table_name, identity_check=False)]
-        indexes, results = {}, {}
-        cursor.execute(pk_uk_sql, (table_name,))
-        data = cursor.fetchall()
-        if data:
-            results.update(data)
-
-        # non-unique, non-compound indexes, only in SS2005?
-        ix_sql = """
-SELECT DISTINCT c.name
-FROM sys.columns c
-INNER JOIN sys.index_columns ic
-  ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-INNER JOIN sys.indexes ix
-  ON ix.object_id = ic.object_id AND ix.index_id = ic.index_id
-INNER JOIN sys.tables t
-  ON t.object_id = ix.object_id
-WHERE ix.object_id IN (
-  SELECT ix.object_id
-  FROM sys.indexes ix
-  GROUP BY ix.object_id, ix.index_id
-  HAVING count(1) = 1)
-AND ix.is_primary_key = 0
-AND ix.is_unique_constraint = 0
-AND t.name = %s"""
-
-        cursor.execute(ix_sql, (table_name,))
-        for column in [r[0] for r in cursor.fetchall()]:
-            if column not in results:
-                results[column] = 'IX'
-
-        for field in field_names:
-            val = results.get(field, None)
-            if val:
-                indexes[field] = dict(primary_key=(val=='PRIMARY KEY'), unique=(val=='UNIQUE'))
-
-        return indexes
 
     def get_key_columns(self, cursor, table_name):
         """
@@ -202,7 +158,7 @@ AND t.name = %s"""
             INNER JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id = fk.parent_column_id
             INNER JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
             INNER JOIN sys.columns rc ON rc.object_id = rt.object_id AND rc.column_id = fk.referenced_column_id
-            WHERE t.name = %s""", [table_name])
+            WHERE t.schema_id = SCHEMA_ID() AND t.name = %s""", [table_name])
         key_columns.extend([tuple(row) for row in cursor.fetchall()])
         return key_columns
 
@@ -219,6 +175,8 @@ AND t.name = %s"""
          * foreign_key: (table, column) of target, or None
          * check: True if check constraint, False otherwise
          * index: True if index, False otherwise.
+         * orders: The order (ASC/DESC) defined for the columns of indexes
+         * type: The type of the index (btree, hash, etc.)
         """
         constraints = {}
         # Loop over the key table, collecting things as constraints
@@ -263,8 +221,11 @@ AND t.name = %s"""
                 kc.table_name = fk.table_name AND
                 kc.column_name = fk.column_name
             WHERE
+                kc.table_schema = SCHEMA_NAME() AND
                 kc.table_name = %s
-            ORDER BY kc.ordinal_position ASC
+            ORDER BY
+                kc.constraint_name ASC,
+                kc.ordinal_position ASC
         """, [table_name])
         for constraint, column, kind, ref_table, ref_column in cursor.fetchall():
             # If we're the first column, make the record
@@ -289,6 +250,7 @@ AND t.name = %s"""
                 kc.constraint_name = c.constraint_name
             WHERE
                 c.constraint_type = 'CHECK' AND
+                kc.table_schema = SCHEMA_NAME() AND
                 kc.table_name = %s
         """, [table_name])
         for constraint, column in cursor.fetchall():
@@ -310,6 +272,9 @@ AND t.name = %s"""
                 i.name AS index_name,
                 i.is_unique,
                 i.is_primary_key,
+                i.type,
+                i.type_desc,
+                ic.is_descending_key,
                 c.name AS column_name
             FROM
                 sys.tables AS t
@@ -324,13 +289,14 @@ AND t.name = %s"""
                 ic.object_id = c.object_id AND
                 ic.column_id = c.column_id
             WHERE
+                t.schema_id = SCHEMA_ID() AND
                 t.name = %s
             ORDER BY
                 i.index_id ASC,
                 ic.index_column_id ASC
         """, [table_name])
         indexes = {}
-        for index, unique, primary, column in cursor.fetchall():
+        for index, unique, primary, type_, desc, order, column in cursor.fetchall():
             if index not in indexes:
                 indexes[index] = {
                     "columns": [],
@@ -339,8 +305,11 @@ AND t.name = %s"""
                     "foreign_key": None,
                     "check": False,
                     "index": True,
+                    "orders": [],
+                    "type": Index.suffix if type_ in (1,2) else desc.lower(),
                 }
             indexes[index]["columns"].append(column)
+            indexes[index]["orders"].append("DESC" if order == 1 else "ASC")
         for index, constraint in indexes.items():
             if index not in constraints:
                 constraints[index] = constraint
