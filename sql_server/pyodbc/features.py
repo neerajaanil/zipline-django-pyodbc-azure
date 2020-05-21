@@ -2,14 +2,13 @@ from django.db.backends.base.features import BaseDatabaseFeatures
 
 
 class DatabaseFeatures(BaseDatabaseFeatures):
-    allow_sliced_subqueries = False
+    allow_sliced_subqueries_with_in = False
     can_introspect_autofield = True
     can_introspect_small_integer_field = True
     can_return_id_from_insert = True
     can_use_chunked_reads = False
     for_update_after_from = True
     greatest_least_ignores_nulls = True
-    has_bulk_insert = True
     has_real_datatype = True
     has_select_for_update = True
     has_select_for_update_nowait = True
@@ -19,7 +18,7 @@ class DatabaseFeatures(BaseDatabaseFeatures):
     ignores_quoted_identifier_case = True
     requires_literal_defaults = True
     requires_sqlparse_for_splitting = False
-    supports_1000_query_parameters = False
+    supports_index_on_text_field = False
     supports_nullable_unique_constraints = False
     supports_paramstyle_pyformat = False
     supports_partially_nullable_unique_constraints = False
