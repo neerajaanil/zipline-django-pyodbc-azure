@@ -1,5 +1,5 @@
 zipline-django-pyodbc-azure
-===================
+=============================
 
 .. image:: http://img.shields.io/pypi/v/django-pyodbc-azure.svg?style=flat
     :target: https://pypi.python.org/pypi/django-pyodbc-azure
