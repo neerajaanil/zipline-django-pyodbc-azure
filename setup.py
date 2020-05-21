@@ -18,10 +18,11 @@ CLASSIFIERS=[
 ]
 
 setup(
-    name='zipline-django-pyodbc',
+    name='zipline-django-pyodbc-azure',
     version='1.11.15.0',
     description='Django backend for Microsoft SQL Server using pyodbc forked from django-pyodbc-azure',
     long_description=open('README.rst').read(),
+    long_description_content_type='text/markdown',
     author='Michiya Takahashi , modified by Neeraja',
     author_email='neeraja.anil2012@gmail.com',
     url='https://github.com/neerajaanil/zipline-django-pyodbc-azure',
